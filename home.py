@@ -13,6 +13,7 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 import subprocess
+from pathlib import Path
 
 # Supabase setup
 # Load dari .env
