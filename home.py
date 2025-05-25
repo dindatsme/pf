@@ -9,14 +9,13 @@ from docx2pdf import convert as docx2pdf_convert
 from streamlit_option_menu import option_menu
 from pdf2docx import Converter
 import uuid
-from datetime import datetime
-import os
+from datetime import datetime, timedelta
+import threading
+import time
+import pandas as pd
 from dotenv import load_dotenv
-import subprocess
-from pathlib import Path
 
-# Supabase setup
-# Load dari .env
+# Load environment variables
 load_dotenv()
 
 # Ambil dari environment
@@ -95,6 +94,142 @@ def inject_css():
     </style>
     """, unsafe_allow_html=True)
 
+# New functions for file upload logging
+def upload_file_to_storage(bucket_name, file_path, file_data):
+    """
+    Upload a file to Supabase Storage and return the public URL
+    """
+    try:
+        # Upload file to storage
+        response = supabase.storage.from_(bucket_name).upload(
+            file_path,
+            file_data,
+            {"content-type": "application/octet-stream"}
+        )
+        
+        if hasattr(response, 'error') and response.error:
+            raise Exception(f"Upload error: {response.error}")
+        
+        # Get public URL
+        public_url = supabase.storage.from_(bucket_name).get_public_url(file_path)
+        return public_url
+    except Exception as e:
+        st.error(f"Failed to upload file: {e}")
+        return None
+
+def log_file_upload(user_id, email, action, activity_type, filename, file_size_mb, file_path, public_url):
+    """
+    Log file upload to both log_user_activity and files tables
+    """
+    try:
+        # Generate a unique ID for both records
+        activity_id = str(uuid.uuid4())
+        file_id = str(uuid.uuid4())
+        timestamp = datetime.utcnow().isoformat()
+        
+        # 1. Insert into log_user_activity table
+        activity_payload = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "email": email,
+            "action": action,
+            "activity_type": activity_type,
+            "filename": filename,
+            "file_size_mb": round(file_size_mb, 2),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        activity_response = supabase.table("log_user_activity").insert(activity_payload).execute()
+        
+        # 2. Insert into files table - ensure filesize is a float/numeric value
+        file_payload = {
+            "id": file_id,
+            "user_id": user_id,
+            "filename": filename,
+            "filesize": float(file_size_mb),  # Explicitly convert to float
+            "file_path": file_path,
+            "public_url": public_url,
+            "uploaded_at": timestamp
+        }
+        
+        file_response = supabase.table("files").insert(file_payload).execute()
+        
+        return activity_response.data is not None and file_response.data is not None
+    except Exception as e:
+        st.error(f"Failed to log file upload: {e}")
+        return False
+
+def handle_file_upload(uploaded_file, user_id, email, action_type):
+    """
+    Handle file upload, storage, and logging
+    """
+    try:
+        # Calculate file size in MB
+        file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+        
+        # Create a unique file path
+        file_path = f"{user_id}/{uuid.uuid4()}_{uploaded_file.name}"
+        
+        # Upload to storage - using "files" bucket as specified
+        public_url = upload_file_to_storage(
+            bucket_name="files",  # Updated bucket name
+            file_path=file_path,
+            file_data=uploaded_file.getvalue()
+        )
+        
+        if not public_url:
+            return False, None
+            
+        # Log the file upload
+        success = log_file_upload(
+            user_id=user_id,
+            email=email,
+            action=action_type,
+            activity_type="file_operation",
+            filename=uploaded_file.name,
+            file_size_mb=file_size_mb,
+            file_path=file_path,
+            public_url=public_url
+        )
+        
+        return success, public_url
+    except Exception as e:
+        st.error(f"Failed to handle file upload: {e}")
+        return False, None
+
+def cleanup_old_files():
+    """
+    Clean up files older than one hour (changed from one minute)
+    """
+    try:
+        # Calculate timestamp for one hour ago (changed from one minute)
+        one_hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        
+        # Get files older than one hour
+        response = supabase.table("files").select("*").lt("uploaded_at", one_hour_ago).execute()
+        
+        if not response.data:
+            return True  # No files to clean up
+            
+        for file in response.data:
+            # 1. Delete from storage
+            bucket_name = "files"  # Updated bucket name
+            file_path = file["file_path"]
+            
+            supabase.storage.from_(bucket_name).remove([file_path])
+            
+            # 2. Update log_user_activity to remove file reference
+            supabase.table("log_user_activity").update({"filename": "deleted_file"}).eq("user_id", file["user_id"]).eq("filename", os.path.basename(file_path)).execute()
+            
+            # 3. Delete from files table
+            supabase.table("files").delete().eq("id", file["id"]).execute()
+            
+        return True
+    except Exception as e:
+        st.error(f"Failed to clean up old files: {e}")
+        return False
+
+# Original functions with modifications for file logging
 def log_user_activity(
     user_id: str,
     email: str,
@@ -204,21 +339,18 @@ def convert_file(input_path, output_path, conversion_type, user_id, email, origi
         input_size = os.path.getsize(input_path) / (1024 * 1024)
         
         if conversion_type == "word_to_pdf":
-            # Gunakan LibreOffice CLI
-            output_dir = str(Path(output_path).parent)
-            subprocess.run([
-                "libreoffice", "--headless", "--convert-to", "pdf", "--outdir",
-                output_dir, input_path
-            ], check=True)
-
-            # Rename hasil output ke output_path jika perlu
-            default_output = os.path.join(output_dir, Path(input_path).stem + ".pdf")
-            if default_output != output_path:
-                os.rename(default_output, output_path)
-        else:  # pdf_to_word
+            docx2pdf_convert(input_path, output_path)
+        elif conversion_type == "pdf_to_word":  # Fixed bug: added explicit condition
             cv = Converter(input_path)
             cv.convert(output_path, start=0, end=None)
             cv.close()
+        elif conversion_type == "image_to_pdf":
+            image = Image.open(input_path)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            image.save(output_path, "PDF", resolution=100.0)
+        else:
+            raise ValueError(f"Conversion type not supported: {conversion_type}")
 
         result_size = os.path.getsize(output_path) / (1024 * 1024)
         billing_amount = int(input_size * 1500)  # 150 coin per MB
@@ -288,7 +420,7 @@ def show_boxes():
             <div class="feature-box">
                 <div class="feature-icon">🔄</div>
                 <div class="feature-title">Konversi File</div>
-                <div class="feature-desc">Ubah file dari Word, PPT, gambar ke PDF, dan sebaliknya.</div>
+                <div class="feature-desc">Ubah file dari Word atau gambar ke PDF.</div>
             </div>
         """, unsafe_allow_html=True)
 
@@ -389,8 +521,8 @@ def show_dashboard():
     with st.container():
         selected = option_menu(
             menu_title=None,
-            options=["Home", "Compress PDF", "Gabungkan PDF", "Konversi File", "Tagihan", "Logout"],
-            icons=["house", "file-earmark-zip", "files", "filetype-pdf", "currency-dollar", "box-arrow-right"],
+            options=["Home", "Compress PDF", "Gabungkan PDF", "Konversi File", "Tagihan", "File saya", "Logout"],
+            icons=["house", "file-earmark-zip", "files", "filetype-pdf", "currency-dollar", "folder2" ,"box-arrow-right"],
             menu_icon="cast",
             default_index=0,
             orientation="horizontal",
@@ -425,6 +557,8 @@ def show_dashboard():
         show_convert_file()
     elif selected == "Tagihan":
         show_billing()
+    elif selected == "File saya":
+        show_uploaded_files()
     elif selected == "Logout":
         st.session_state.logged_in = False
         st.session_state.user_email = ""
@@ -443,6 +577,18 @@ def show_compress_pdf():
     uploaded_file = st.file_uploader("Unggah file PDF", type="pdf")
     if uploaded_file is not None:
         if st.button("Kompres PDF"):
+            # First, handle the file upload and logging
+            upload_success, public_url = handle_file_upload(
+                uploaded_file=uploaded_file,
+                user_id=st.session_state.user_id,
+                email=st.session_state.user_email,
+                action_type="upload_for_compression"
+            )
+            
+            if not upload_success:
+                st.error("Gagal mengunggah file")
+                return
+                
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_input:
                 tmp_input.write(uploaded_file.read())
                 tmp_input_path = tmp_input.name
@@ -460,7 +606,9 @@ def show_compress_pdf():
 
                 if success:
                     with open(tmp_output_path, "rb") as f:
-                        st.success(f"PDF berhasil dikompres! (Biaya: Rp. {billing_amount} )")
+                        # Format billing amount as Indonesian Rupiah
+                        formatted_billing = f"Rp {billing_amount:,}".replace(",", ".")
+                        st.success(f"PDF berhasil dikompres! (Biaya: {formatted_billing})")
                         st.download_button(
                             label="⬇️ Download PDF Terkompres",
                             data=f,
@@ -483,6 +631,19 @@ def show_merge_pdf():
     
     if uploaded_files and len(uploaded_files) >= 2:
         if st.button("Gabungkan PDF"):
+            # Log each file upload
+            for uploaded_file in uploaded_files:
+                upload_success, _ = handle_file_upload(
+                    uploaded_file=uploaded_file,
+                    user_id=st.session_state.user_id,
+                    email=st.session_state.user_email,
+                    action_type="upload_for_merge"
+                )
+                
+                if not upload_success:
+                    st.error(f"Gagal mengunggah file: {uploaded_file.name}")
+                    return
+            
             with tempfile.TemporaryDirectory() as temp_dir:
                 output_path = os.path.join(temp_dir, "merged.pdf")
                 
@@ -496,7 +657,9 @@ def show_merge_pdf():
 
                     if success:
                         with open(output_path, "rb") as f:
-                            st.success(f"PDF berhasil digabungkan! (Biaya: Rp. {billing_amount} )")
+                            # Format billing amount as Indonesian Rupiah
+                            formatted_billing = f"Rp {billing_amount:,}".replace(",", ".")
+                            st.success(f"PDF berhasil digabungkan! (Biaya: {formatted_billing})")
                             st.download_button(
                                 label="⬇️ Download PDF Gabungan",
                                 data=f,
@@ -512,13 +675,25 @@ def show_convert_file():
     
     conversion_type = st.radio(
         "Jenis Konversi",
-        ["Word ke PDF", "PDF ke Word"],
+        ["Word ke PDF", "PDF ke Word", "Image ke PDF"],
         horizontal=True
     )
     
     if conversion_type == "Word ke PDF":
         uploaded_file = st.file_uploader("Unggah file Word (.docx)", type=["docx"])
         if uploaded_file and st.button("Konversi ke PDF"):
+            # Log file upload
+            upload_success, _ = handle_file_upload(
+                uploaded_file=uploaded_file,
+                user_id=st.session_state.user_id,
+                email=st.session_state.user_email,
+                action_type="upload_for_word_to_pdf"
+            )
+            
+            if not upload_success:
+                st.error("Gagal mengunggah file")
+                return
+                
             with tempfile.TemporaryDirectory() as tmpdir:
                 input_path = os.path.join(tmpdir, "input.docx")
                 output_path = os.path.join(tmpdir, "output.pdf")
@@ -538,16 +713,30 @@ def show_convert_file():
 
                     if success:
                         with open(output_path, "rb") as f:
-                            st.success(f"Konversi berhasil! (Biaya: Rp. {billing_amount} )")
+                            # Format billing amount as Indonesian Rupiah
+                            formatted_billing = f"Rp {billing_amount:,}".replace(",", ".")
+                            st.success(f"Konversi berhasil! (Biaya: {formatted_billing})")
                             st.download_button(
                                 label="⬇️ Download PDF",
                                 data=f,
                                 file_name="converted.pdf",
                                 mime="application/pdf"
                             )
-    else:
+    elif conversion_type == "PDF ke Word":
         uploaded_file = st.file_uploader("Unggah file PDF", type=["pdf"])
         if uploaded_file and st.button("Konversi ke Word"):
+            # Log file upload
+            upload_success, _ = handle_file_upload(
+                uploaded_file=uploaded_file,
+                user_id=st.session_state.user_id,
+                email=st.session_state.user_email,
+                action_type="upload_for_pdf_to_word"
+            )
+            
+            if not upload_success:
+                st.error("Gagal mengunggah file")
+                return
+                
             with tempfile.TemporaryDirectory() as tmpdir:
                 input_path = os.path.join(tmpdir, "input.pdf")
                 output_path = os.path.join(tmpdir, "output.docx")
@@ -567,12 +756,57 @@ def show_convert_file():
 
                     if success:
                         with open(output_path, "rb") as f:
-                            st.success(f"Konversi berhasil! (Biaya: Rp. {billing_amount} )")
+                            # Format billing amount as Indonesian Rupiah
+                            formatted_billing = f"Rp {billing_amount:,}".replace(",", ".")
+                            st.success(f"Konversi berhasil! (Biaya: {formatted_billing})")
                             st.download_button(
                                 label="⬇️ Download Word",
                                 data=f,
                                 file_name="converted.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            )
+    else: # Image to PDF
+        uploaded_file = st.file_uploader("Unggah file gambar", type=["jpg", "jpeg", "png"])
+        if uploaded_file and st.button("Konversi ke PDF"):
+            # Log file upload
+            upload_success, _ = handle_file_upload(
+                uploaded_file=uploaded_file,
+                user_id=st.session_state.user_id,
+                email=st.session_state.user_email,
+                action_type="upload_for_image_to_pdf"
+            )
+            
+            if not upload_success:
+                st.error("Gagal mengunggah file")
+                return
+                
+            with tempfile.TemporaryDirectory() as tmpdir:
+                input_path = os.path.join(tmpdir, "input.jpg")
+                output_path = os.path.join(tmpdir, "output.pdf")
+
+                with open(input_path, "wb") as f:
+                    f.write(uploaded_file.read())
+
+                with st.spinner("Mengonversi..."):
+                    success, billing_amount = convert_file(
+                        input_path=input_path,
+                        output_path=output_path,
+                        conversion_type="image_to_pdf",
+                        user_id=st.session_state.user_id,
+                        email=st.session_state.user_email,
+                        original_filename=uploaded_file.name
+                    )
+
+                    if success:
+                        with open(output_path, "rb") as f:
+                            # Format billing amount as Indonesian Rupiah
+                            formatted_billing = f"Rp {billing_amount:,}".replace(",", ".")
+                            st.success(f"Konversi berhasil! (Biaya: {formatted_billing})")
+                            st.download_button(
+                                label="⬇️ Download PDF",
+                                data=f,
+                                file_name="converted.pdf",
+                                mime="application/pdf"
                             )
 
 def show_billing():
@@ -609,11 +843,20 @@ def show_billing():
             font-weight: bold;
             color: #000;
         }
+        .download-link {
+            color: #4fc3f7;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .download-link:hover {
+            text-decoration: underline;
+        }
     </style>
     """, unsafe_allow_html=True)
 
     user_email = st.session_state.get("user_email")
     if user_email:
+        # Get billing data from log_user_activity
         billing_response = supabase.table("log_user_activity") \
             .select("timestamp, action, filename, file_size_mb, result_file_size_mb, billing_amount") \
             .eq("email", user_email) \
@@ -621,9 +864,21 @@ def show_billing():
             .execute()
 
         billing_data = billing_response.data
+        
+        # Get file upload data from files table
+        files_response = supabase.table("files") \
+            .select("*") \
+            .eq("user_id", st.session_state.user_id) \
+            .order("uploaded_at", desc=True) \
+            .execute()
+            
+        files_data = files_response.data
 
         if billing_data:
             total_tagihan = sum(item.get("billing_amount", 0) or 0 for item in billing_data)
+
+            # Format total tagihan as Indonesian Rupiah
+            formatted_total = f"Rp {total_tagihan:,}".replace(",", ".")
 
             # Header dengan judul & total tagihan di kanan
             st.markdown(f"""
@@ -631,7 +886,7 @@ def show_billing():
                 <div class="billing-title">💳 Tagihan Saya</div>
                 <div class="billing-metric">
                     <div class="billing-metric-label">Total Tagihan</div>
-                    <div class="billing-metric-value">Rp. {total_tagihan:,.0f}</div>
+                    <div class="billing-metric-value">{formatted_total}</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -641,6 +896,9 @@ def show_billing():
             df = pd.DataFrame(billing_data)
             # Format tanggal saja dari timestamp
             df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.date
+            
+            # Format billing amount as Indonesian Rupiah
+            df["billing_amount"] = df["billing_amount"].apply(lambda x: f"Rp {x:,}".replace(",", ".") if x else "Rp 0")
 
             df = df.rename(columns={
                 "timestamp": "Waktu",
@@ -648,7 +906,7 @@ def show_billing():
                 "filename": "Nama File",
                 "file_size_mb": "Ukuran Awal (MB)",
                 "result_file_size_mb": "Ukuran Akhir (MB)",
-                "billing_amount": "Biaya (Rp)"
+                "billing_amount": "Biaya"
             })
 
             st.caption("Riwayat tagihan Anda")
@@ -657,6 +915,74 @@ def show_billing():
             st.info("Belum ada aktivitas dari Anda")
     else:
         st.warning("Anda belum login")
+
+# Menampilkan file yang diunggah
+def show_uploaded_files():
+    st.markdown("""
+    <style>
+        .download-link {
+            color: #4fc3f7;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .download-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    user_email = st.session_state.get("user_email")
+    if user_email:
+        # Get billing data from log_user_activity
+        billing_response = supabase.table("log_user_activity") \
+            .select("timestamp, action, filename, file_size_mb, result_file_size_mb, billing_amount") \
+            .eq("email", user_email) \
+            .order("timestamp", desc=True) \
+            .execute()
+
+        billing_data = billing_response.data
+        
+        # Get file upload data from files table
+        files_response = supabase.table("files") \
+            .select("*") \
+            .eq("user_id", st.session_state.user_id) \
+            .order("uploaded_at", desc=True) \
+            .execute()
+            
+        files_data = files_response.data
+            
+            # Display uploaded files
+        if files_data:
+                st.markdown("### 📁 File Terunggah")
+                st.caption("File yang telah Anda unggah (akan dihapus setelah 1 jam)")
+                
+                files_df = pd.DataFrame(files_data)
+                files_df["uploaded_at"] = pd.to_datetime(files_df["uploaded_at"])
+                tz = files_df["uploaded_at"].dt.tz  # Get timezone from uploaded_at
+                now = pd.Timestamp.now(tz=tz)  # Make now tz-aware
+                files_df["time_remaining"] = (files_df["uploaded_at"] + pd.Timedelta(hours=1) - now).dt.total_seconds()
+
+                # Format for display
+                files_df = files_df.rename(columns={
+                    "filename": "Nama File",
+                    "filesize": "Ukuran (MB)",
+                    "uploaded_at": "Waktu Unggah",
+                    "time_remaining": "Waktu Tersisa (detik)",
+                    "file_path": "Path File",
+                    "public_url": "URL Publik"
+                })
+
+                # Create a download link column
+                def make_download_link(row):
+                    return f'<a href="{row["URL Publik"]}" target="_blank" class="download-link">Download</a>'
+
+                files_df["Download"] = files_df.apply(make_download_link, axis=1)
+
+                # Select columns to display
+                display_df = files_df[["Nama File", "Ukuran (MB)", "Waktu Unggah", "Waktu Tersisa (detik)", "Path File", "URL Publik", "Download"]]
+                st.write(display_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+        else:
+            st.info("File expired atau belum ada file yang diunggah.")
 
 def show_login_page():
     st.markdown("""
@@ -729,6 +1055,8 @@ def login_user(email, password):
                 st.session_state.user_email = user["email"]
                 st.session_state.user_nama = user["nama"]
                 st.session_state.user_id = user["id"]
+                # Save session to prevent losing state on refresh
+                st.session_state["_is_session_persisted"] = True
                 return user
             else:
                 st.error("Password salah.")
@@ -764,12 +1092,33 @@ def register_user(email, password, nama):
         st.error(f"Registrasi gagal: {e}")
         return None
 
+def setup_cleanup_job():
+    """
+    Set up a background thread to clean up old files
+    """
+    def cleanup_job():
+        while True:
+            cleanup_old_files()
+            time.sleep(60)  # Run every minute
+    
+    # Start the cleanup thread
+    cleanup_thread = threading.Thread(target=cleanup_job, daemon=True)
+    cleanup_thread.start()
+
 def main():
     inject_css()
+    
+    # Setup cleanup job
+    setup_cleanup_job()
 
     # Setup session state
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
+        
+    # Check for persisted session
+    if st.session_state.get("_is_session_persisted"):
+        # Session already exists, no need to relogin
+        pass
 
     # Jika sudah login
     if st.session_state.logged_in:
