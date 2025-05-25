@@ -1,0 +1,9 @@
+streamlit
+bcrypt
+pillow
+supabase
+pypdf
+docx2pdf
+streamlit-option-menu
+pdf2docx
+python-dotenv
