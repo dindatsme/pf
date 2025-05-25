@@ -14,12 +14,9 @@ import os
 from dotenv import load_dotenv
 
 # Supabase setup
-# Load dari .env
-load_dotenv()
-
-# Ambil dari environment
-url = os.getenv("SUPABASE_URL")
-key = os.getenv("SUPABASE_KEY")
+# Ambil dari environment langsung (Render akan inject saat runtime)
+url = os.environ["SUPABASE_URL"]
+key = os.environ["SUPABASE_KEY"]
 
 supabase: Client = create_client(url, key)
 
