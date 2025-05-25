@@ -26,6 +26,7 @@ key = os.getenv("SUPABASE_KEY")
 
 supabase: Client = create_client(url, key)
 
+st.set_option('server.maxUploadSize', 200)
 st.set_page_config(layout="wide")
 # CSS Custom
 def inject_css():
