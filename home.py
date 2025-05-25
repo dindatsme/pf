@@ -202,7 +202,17 @@ def convert_file(input_path, output_path, conversion_type, user_id, email, origi
         input_size = os.path.getsize(input_path) / (1024 * 1024)
         
         if conversion_type == "word_to_pdf":
-            docx2pdf_convert(input_path, output_path)
+            # Gunakan LibreOffice CLI
+            output_dir = str(Path(output_path).parent)
+            subprocess.run([
+                "libreoffice", "--headless", "--convert-to", "pdf", "--outdir",
+                output_dir, input_path
+            ], check=True)
+
+            # Rename hasil output ke output_path jika perlu
+            default_output = os.path.join(output_dir, Path(input_path).stem + ".pdf")
+            if default_output != output_path:
+                os.rename(default_output, output_path)
         else:  # pdf_to_word
             cv = Converter(input_path)
             cv.convert(output_path, start=0, end=None)
