@@ -1,0 +1,14 @@
+# render.yaml
+services:
+  - type: web
+    name: streamlit-app
+    env: python
+    plan: free   # atau bisa "starter" untuk lebih stabil
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=10000 --server.address=0.0.0.0
+    envVars:
+      - key: SUPABASE_URL
+        value: https://kgulogjssuqxrmjfzcma.supabase.co
+      - key: SUPABASE_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtndWxvZ2pzc3VxeHJtamZ6Y21hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDc0NjQ0OTAsImV4cCI6MjA2MzA0MDQ5MH0.IQIDWtnLxMzmSlVH48vTjAo6tVyDaCD5sfa3LfkEjZ4
+
