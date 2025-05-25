@@ -6,6 +6,9 @@ WORKDIR /app
 # Install system dependencies (opsional tapi bantu kalau ada error dependensi wheel / build)
 RUN apt-get update && apt-get install -y \
     build-essential \
+    libreoffice \
+    fonts-dejavu-core \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements dan install Python dependencies
