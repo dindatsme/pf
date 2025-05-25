@@ -22,4 +22,4 @@ COPY . .
 EXPOSE 8501
 
 # Jalankan aplikasi Streamlit
-CMD ["streamlit", "run", "home.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]
+CMD ["streamlit", "run", "home.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.enableCORS=false", "--server.enableXsrfProtection=false", "--server.maxUploadSize=200"]
